@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"github.com/jedib0t/go-pretty/v6/table"
 	"math"
 	"math/rand"
 	"net"
@@ -66,21 +67,6 @@ func SpeedTest(c *cli.Context) error {
 		return nil
 	}
 
-	if c.Bool(defs.OptionCheckUpdate) {
-		if latest, err := getVersion(c); err != nil {
-			log.Errorf("Error when fetching latest version: %s", err)
-		} else {
-			if latest.Version != defs.ProgVersion {
-				log.Warnf("Current version: %s", defs.ProgVersion)
-				log.Warnf("New version available: %s", latest.Version)
-				log.Warnf("Download Url: %s", latest.Url)
-			} else {
-				log.Warn("You are using the latest version")
-			}
-		}
-		return nil
-	}
-
 	if c.String(defs.OptionSource) != "" && c.String(defs.OptionInterface) != "" {
 		return fmt.Errorf("incompatible options '%s' and '%s'", defs.OptionSource, defs.OptionInterface)
 	}
@@ -101,6 +87,25 @@ func SpeedTest(c *cli.Context) error {
 		return errors.New("invalid concurrent requests setting")
 	}
 
+	if req := c.Int(defs.OptionPingCount); req <= 0 {
+		log.Errorf("Ping count cannot be lower than 1: %d is given", req)
+		return errors.New("invalid ping count setting")
+	}
+
+	if req := c.Int(defs.OptionUploadSize); req <= 0 {
+		log.Errorf("Upload size cannot be lower than 1: %d is given", req)
+		return errors.New("invalid upload size setting")
+	}
+
+	if req := c.Int(defs.OptionDuration); req > 150 {
+		log.Errorf("Duration too long: %d seconds", req)
+		return errors.New("invalid duration setting")
+	}
+
+	if c.Bool(defs.OptionNoDownload) || c.Bool(defs.OptionNoUpload) {
+		log.Warnf("The --%s and --%s options are deprecated and will be removed in the future", defs.OptionNoDownload, defs.OptionNoUpload)
+	}
+
 	// HTTP requests timeout
 	http.DefaultClient.Timeout = time.Duration(c.Int(defs.OptionTimeout)) * time.Second
 
@@ -109,13 +114,17 @@ func SpeedTest(c *cli.Context) error {
 	noICMP := c.Bool(defs.OptionNoICMP)
 
 	var network string
+	var stack defs.Stack
 	switch {
 	case forceIPv4:
 		network = "ip4"
+		stack = defs.StackIPv4
 	case forceIPv6:
 		network = "ip6"
+		stack = defs.StackIPv6
 	default:
 		network = "ip"
+		stack = defs.StackAll
 	}
 
 	transport := http.DefaultTransport.(*http.Transport).Clone()
@@ -184,17 +193,52 @@ func SpeedTest(c *cli.Context) error {
 
 	http.DefaultClient.Transport = transport
 
-	var ispInfo *defs.IPInfoResponse
-	var servers []defs.Server
-	var err error
-
-	if !c.Bool(defs.OptionList) {
-		ispInfo, _ = defs.GetIPInfo()
+	if c.Bool(defs.OptionCheckUpdate) {
+		if latest, err := getVersion(c); err != nil {
+			log.Errorf("Error when fetching latest version: %s", err)
+		} else {
+			if latest.Version != defs.ProgVersion {
+				log.Warnf("Current version: %s", defs.ProgVersion)
+				log.Warnf("New version available: %s", latest.Version)
+				log.Warnf("Download Url: %s", latest.Url)
+			} else {
+				log.Warn("You are using the latest version")
+			}
+		}
+		return nil
 	}
 
+	var ispInfo *defs.IPInfoResponse
+	var servers []defs.Server
+	var provinceMap map[uint8]defs.ProvinceInfo = nil
+
 	simple := true
-	if forceIPv6 || c.Bool(defs.OptionList) || c.IsSet(defs.OptionServer) || c.IsSet(defs.OptionServerGroup) || ispInfo == nil || ispInfo.IP == "" || ispInfo.Country != "中国" {
+	if c.IsSet(defs.OptionServer) || c.IsSet(defs.OptionServerGroup) {
 		simple = false
+	}
+	hasLo := false
+	if c.IsSet(defs.OptionServerGroup) {
+		for _, s := range c.StringSlice(defs.OptionServerGroup) {
+			if strings.Contains(s, "lo") {
+				hasLo = true
+				break
+			}
+		}
+
+	}
+	if simple || !c.Bool(defs.OptionList) || (c.IsSet(defs.OptionServerGroup) && hasLo) {
+		ispInfo, _ = defs.GetIPInfo()
+		if ispInfo != nil {
+			if ispInfo.Country == "中国" {
+				if ispInfo.Province != "" {
+					provinceMap = initProvinceMap()
+					ispInfo.ProvId = MatchProvince(ispInfo.Province, &provinceMap)
+				}
+				if ispInfo.ISP != "" {
+					ispInfo.ISPId = MatchISP(ispInfo.ISP)
+				}
+			}
+		}
 	}
 
 	// fetch the server list JSON and parse it into the `servers` array
@@ -202,27 +246,22 @@ func SpeedTest(c *cli.Context) error {
 
 	excludes := c.StringSlice(defs.OptionExclude)
 	if simple {
-		var serversT []defs.Server
-
-		if serversT, err = getGlobalServerList(ispInfo.IP, 0); err != nil {
+		if serversT, err := getServerMatch(c, ispInfo, stack); err != nil {
 			log.Errorf("Error when fetching server list: %s", err)
 			return err
-		}
-		if len(excludes) > 0 {
-			serversT = preprocessServers(serversT, excludes)
-		}
-		log.Debugf("Find %d servers", len(serversT))
-		if server, ok := selectServer("", serversT, network, c, noICMP); ok {
-			servers = append(servers, server)
+		} else {
+			serversT = preprocessServers(stack, serversT, excludes)
+
+			if c.Bool(defs.OptionList) {
+				servers = append(servers, serversT...)
+			} else {
+				log.Debugf("Find %d servers", len(serversT))
+				if server, ok := selectServer("", serversT, network, c, noICMP); ok {
+					servers = append(servers, server)
+				}
+			}
 		}
 	} else {
-		var provinces []defs.ProvinceInfo
-		gocsv.UnmarshalBytes(ProvinceListByte, &provinces)
-		provinceMap := make(map[uint8]defs.ProvinceInfo)
-		for _, p := range provinces {
-			provinceMap[p.ID] = p
-		}
-
 		var _servers []string
 		if c.IsSet(defs.OptionServer) {
 			_tmpMap := make(map[string]byte)
@@ -236,6 +275,9 @@ func SpeedTest(c *cli.Context) error {
 
 		var _groups []string
 		if c.IsSet(defs.OptionServerGroup) {
+			if provinceMap == nil {
+				provinceMap = initProvinceMap()
+			}
 			_tmpMap := make(map[string]byte)
 			for _, s := range c.StringSlice(defs.OptionServerGroup) {
 				sg := strings.Split(s, "@")
@@ -258,9 +300,11 @@ func SpeedTest(c *cli.Context) error {
 				var province uint8 = 0
 				if sgp != "" {
 					if sgp == "lo" {
-						province = MatchProvince(ispInfo.Province, &provinces)
+						if ispInfo != nil {
+							province = ispInfo.ProvId
+						}
 					} else {
-						for _, p := range provinces {
+						for _, p := range provinceMap {
 							if p.Code == sgp {
 								province = p.ID
 								break
@@ -275,7 +319,9 @@ func SpeedTest(c *cli.Context) error {
 				var isp uint8 = 0
 				if sgi != "" {
 					if sgi == "lo" {
-						isp = MatchISP(ispInfo.ISP)
+						if ispInfo != nil {
+							isp = ispInfo.ISPId
+						}
 					} else {
 						for _, i := range defs.ISPMap {
 							if sgi == strconv.Itoa(int(i.ASN)) || sgi == i.Short {
@@ -296,56 +342,27 @@ func SpeedTest(c *cli.Context) error {
 			}
 		}
 
-		if !c.IsSet(defs.OptionServer) && !c.IsSet(defs.OptionServerGroup) && !c.Bool(defs.OptionList) {
-			if ispInfo != nil && (ispInfo.Province != "" || ispInfo.ISP != "") && ispInfo.Country == "中国" {
-				province, isp := uint8(0), uint8(0)
-				if ispInfo.Province != "" {
-					province = MatchProvince(ispInfo.Province, &provinces)
-				}
-				if ispInfo.ISP != "" {
-					isp = MatchISP(ispInfo.ISP)
-				}
-				if province != 0 || isp != 0 {
-					_groups = append(_groups, fmt.Sprintf("%d@%d", province, isp))
-				} else {
-					_groups = append(_groups, "44@3")
-				}
-			} else {
-				_groups = append(_groups, "44@3")
-			}
+		if c.IsSet(defs.OptionServerGroup) && len(_groups) == 0 {
+			err := errors.New("specified server group(s) not found")
+			log.Errorf("Error when selecting server: %s", err)
+			return err
 		}
 
-		groups, err := getServerList(c, &_servers, &_groups)
+		groups, err := getServerList(c, &_servers, &_groups, stack)
 		if err != nil {
 			log.Errorf("Error when fetching server list: %s", err)
 			return err
 		}
 		for _, g := range groups {
-			var serversT []defs.Server
-
-			for _, n := range g.Node {
-				if n.IP != "" && !forceIPv6 {
-					if n.Host == "" {
-						n.Host = n.IP
-					}
-				} else if n.IPv6 != "" && !forceIPv4 {
-					if n.Host == "" {
-						n.Host = n.IPv6
-					}
-				} else {
-					continue
-				}
-				serversT = append(serversT, n)
-			}
-
-			if len(excludes) > 0 {
-				serversT = preprocessServers(serversT, c.StringSlice(defs.OptionExclude))
-			}
+			serversT := preprocessServers(stack, g.Node, excludes)
 
 			if g.Group == "" || c.Bool(defs.OptionList) {
 				servers = append(servers, serversT...)
 			} else {
 				if g.Group != "" {
+					if provinceMap == nil {
+						provinceMap = initProvinceMap()
+					}
 					_g := strings.Split(g.Group, "@")
 					province, _ := strconv.Atoi(_g[0])
 					isp, _ := strconv.Atoi(_g[1])
@@ -363,30 +380,53 @@ func SpeedTest(c *cli.Context) error {
 
 	log.Debugf("Selected %d servers", len(servers))
 	if len(servers) == 0 {
-		err = errors.New("specified server(s) not found")
-	}
-
-	if err != nil {
-		log.Errorf("Error when parsing server list: %s", err)
+		err := errors.New("specified server(s) not found")
+		log.Errorf("Error when selecting server: %s", err)
 		return err
 	}
 
 	// if --list is given, list all the servers fetched and exit
 	if c.Bool(defs.OptionList) {
+		if provinceMap == nil {
+			provinceMap = initProvinceMap()
+		}
+		log.Infoln()
+		t := table.NewWriter()
+		t.SetOutputMirror(os.Stdout)
+		t.AppendHeader(table.Row{"ID", "Name", "Prov", "City", "ISP", "v4", "v6"})
+
 		for _, svr := range servers {
-			var stacks []string
+			province := svr.Province
+			if province == "" && svr.Prov != 0 {
+				province = provinceMap[svr.Prov].Short
+			}
+			v4, v6 := "N", "N"
 			if svr.IP != "" {
-				stacks = append(stacks, "IPv4")
+				v4 = "Y"
 			}
 			if svr.IPv6 != "" {
-				stacks = append(stacks, "IPv6")
+				v6 = "Y"
 			}
-			fmt.Printf("%s: %s (%s%s) %v\n", svr.ID, svr.Name, svr.Province, defs.ISPMap[svr.ISP].Name, stacks)
+			t.AppendRow(table.Row{svr.ID, svr.Name, province, svr.City, defs.ISPMap[svr.ISP].Name, v4, v6})
 		}
+
+		t.Style().Options.DrawBorder = false
+		t.Style().Options.SeparateColumns = false
+		t.Render()
 		return nil
 	}
 
 	return doSpeedTest(c, servers, network, silent, noICMP, ispInfo)
+}
+
+func initProvinceMap() map[uint8]defs.ProvinceInfo {
+	var provinces []defs.ProvinceInfo
+	gocsv.UnmarshalBytes(ProvinceListByte, &provinces)
+	provinceMap := make(map[uint8]defs.ProvinceInfo)
+	for _, p := range provinces {
+		provinceMap[p.ID] = p
+	}
+	return provinceMap
 }
 
 func selectServer(logPre string, servers []defs.Server, network string, c *cli.Context, noICMP bool) (defs.Server, bool) {
@@ -465,7 +505,7 @@ func pingWorker(jobs <-chan PingJob, results chan<- PingResult, wg *sync.WaitGro
 			// if server is up, get ping
 			ping, _, err := server.ICMPPingAndJitter(1, srcIp, network)
 			if err != nil {
-				log.Debugf("Can't ping server %s (%s), skipping", server.Name, server.IP)
+				log.Debugf("Can't ping server %s (%s), skipping", server.Name, server.Target)
 				wg.Done()
 				return
 			}
@@ -480,11 +520,18 @@ func pingWorker(jobs <-chan PingJob, results chan<- PingResult, wg *sync.WaitGro
 }
 
 // preprocessServers makes some needed modifications to the servers fetched
-func preprocessServers(servers []defs.Server, excludes []string) []defs.Server {
+func preprocessServers(stack defs.Stack, servers []defs.Server, excludes []string) []defs.Server {
 	// exclude servers from --exclude
 	var ret []defs.Server
 	for _, server := range servers {
-		if contains(excludes, server.ID) {
+		if len(excludes) > 0 && contains(excludes, server.ID) {
+			continue
+		}
+		if server.IP != "" && stack != defs.StackIPv6 {
+			server.Target = server.IP
+		} else if server.IPv6 != "" && stack != defs.StackIPv4 {
+			server.Target = server.IPv6
+		} else {
 			continue
 		}
 		ret = append(ret, server)

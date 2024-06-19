@@ -12,48 +12,12 @@ import (
 	"net/url"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/briandowns/spinner"
 	"github.com/go-ping/ping"
 	log "github.com/sirupsen/logrus"
 )
-
-type ServerGlobal struct {
-	ID   int    `json:"hostid,string"`
-	Name string `json:"hostname"`
-	IP   string `json:"hostip"`
-	Port string `json:"port"`
-	Prov string `json:"pname"`
-	City string `json:"city"`
-	Loc  string `json:"location,omitempty"`
-	ISP  string `json:"oper,omitempty"`
-}
-
-func (s *ServerGlobal) GetISP() *ISPInfo {
-	switch s.ISP {
-	case "电信":
-		return &TELECOM
-	case "联通":
-		return &UNICOM
-	case "移动":
-		return &MOBILE
-	case "教育网":
-		return &CERNET
-	case "广电网":
-		return &CATV
-	case "鹏博士":
-		return &DRPENG
-	default:
-		for _, isp := range ISPMap {
-			if strings.HasSuffix(s.Name, isp.Name) {
-				return isp
-			}
-		}
-		return &DEFISP
-	}
-}
 
 type ServerType uint8
 
@@ -69,6 +33,7 @@ type Server struct {
 	Name        string     `json:"name"`
 	IP          string     `json:"ip"`
 	IPv6        string     `json:"ipv6"`
+	Target      string     `json:"-"`
 	Host        string     `json:"host"`
 	Port        uint16     `json:"port"`
 	Prov        uint8      `json:"province"`
@@ -82,67 +47,78 @@ type Server struct {
 	NoICMP      bool       `json:"-"`
 }
 
+func (s *Server) GetHost() string {
+	if s.Port != 80 {
+		return net.JoinHostPort(s.Host, strconv.Itoa(int(s.Port)))
+	} else {
+		return s.Host
+	}
+}
+
 func (s *Server) URL() *url.URL {
 	u := url.URL{
 		Scheme: "http",
-		Host:   net.JoinHostPort(s.Host, strconv.Itoa(int(s.Port))),
+		Host:   net.JoinHostPort(s.Target, strconv.Itoa(int(s.Port))),
 	}
 	return &u
 }
 
-func (s *Server) DownloadURL() string {
+func (s *Server) DownloadURL() *url.URL {
 	if s.DownloadURI != "" {
-		return fmt.Sprintf("%s%s", s.URL().String(), s.DownloadURI)
+		return s.URL().JoinPath(s.DownloadURI)
 	} else {
 		switch s.Type {
 		case Perception:
-			return fmt.Sprintf("%s/speedtest/download", s.URL().String())
+			return s.URL().JoinPath("/speedtest/download")
 		case WirelessSpeed:
-			return fmt.Sprintf("%s/GSpeedTestServer/download", s.URL().String())
+			return s.URL().JoinPath("/GSpeedTestServer/download")
 		default:
-			return fmt.Sprintf("%s/speed/File(1G).dl", s.URL().String())
+			return s.URL().JoinPath("/speed/File(1G).dl")
 		}
 	}
 }
 
-func (s *Server) UploadURL() string {
+func (s *Server) UploadURL() *url.URL {
 	if s.UploadURI != "" {
-		return fmt.Sprintf("%s%s", s.URL().String(), s.UploadURI)
+		return s.URL().JoinPath(s.UploadURI)
 	} else {
 		switch s.Type {
 		case Perception:
-			return fmt.Sprintf("%s/speedtest/upload", s.URL().String())
+			return s.URL().JoinPath("/speedtest/upload")
 		case WirelessSpeed:
-			return fmt.Sprintf("%s/GSpeedTestServer/upload", s.URL().String())
+			return s.URL().JoinPath("/GSpeedTestServer/upload")
 		default:
-			return fmt.Sprintf("%s/speed/doAnalsLoad.do", s.URL().String())
+			return s.URL().JoinPath("/speed/doAnalsLoad.do")
 		}
 	}
 }
 
-func (s *Server) PingURL() string {
+func (s *Server) PingURL() *url.URL {
 	if s.PingURI != "" {
-		return fmt.Sprintf("%s%s", s.URL().String(), s.PingURI)
+		return s.URL().JoinPath(s.PingURI)
 	} else {
 		switch s.Type {
 		case Perception:
-			return fmt.Sprintf("%s/speedtest/ping", s.URL().String())
+			return s.URL().JoinPath("/speedtest/ping")
 		case WirelessSpeed:
-			return fmt.Sprintf("%s/GSpeedTestServer/", s.URL().String())
+			return s.URL().JoinPath("/GSpeedTestServer/")
 		default:
-			return fmt.Sprintf("%s/speed/", s.URL().String())
+			return s.URL().JoinPath("/speed/")
 		}
 	}
 }
 
 // IsUp checks the speed test backend is up by accessing the ping URL
 func (s *Server) IsUp() bool {
-	req, err := http.NewRequest(http.MethodGet, s.PingURL(), nil)
+	req, err := http.NewRequest(http.MethodGet, s.PingURL().String(), nil)
 	if err != nil {
 		log.Debugf("Failed when creating HTTP request: %s", err)
 		return false
 	}
 
+	if s.Host != "" {
+		req.Host = s.GetHost()
+	}
 	req.Header.Set("User-Agent", AndroidUA)
 
 	resp, err := http.DefaultClient.Do(req)
@@ -163,11 +139,7 @@ func (s *Server) ICMPPingAndJitter(count int, srcIp, network string) (float64, f
 		return s.PingAndJitter(count + 2)
 	}
 
-	p, err := ping.NewPinger(s.Host)
-	if err != nil {
-		log.Debugf("ICMP ping failed: %s, will use HTTP ping", err)
-		return s.PingAndJitter(count + 2)
-	}
+	p := ping.New(s.Target)
 	p.SetPrivileged(true)
 	p.SetNetwork(network)
 	p.Count = count
@@ -203,7 +175,7 @@ func (s *Server) ICMPPingAndJitter(count int, srcIp, network string) (float64, f
 
 	if len(stats.Rtts) == 0 {
 		s.NoICMP = true
-		log.Debugf("No ICMP pings returned for server %s (%s), trying TCP ping", s.Name, s.IP)
+		log.Debugf("No ICMP pings returned for server %s (%s), trying TCP ping", s.Name, s.Target)
 		return s.PingAndJitter(count + 2)
 	}
 
@@ -214,12 +186,15 @@ func (s *Server) ICMPPingAndJitter(count int, srcIp, network string) (float64, f
 func (s *Server) PingAndJitter(count int) (float64, float64, error) {
 	var pings []float64
 
-	req, err := http.NewRequest(http.MethodGet, s.PingURL(), nil)
+	req, err := http.NewRequest(http.MethodGet, s.PingURL().String(), nil)
 	if err != nil {
 		log.Debugf("Failed when creating HTTP request: %s", err)
 		return 0, 0, err
 	}
 
+	if s.Host != "" {
+		req.Host = s.GetHost()
+	}
 	req.Header.Set("User-Agent", AndroidUA)
 
 	for i := 0; i < count; i++ {
@@ -266,17 +241,20 @@ func (s *Server) Download(silent, useBytes, useMebi bool, requests int, duration
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	url := s.DownloadURL()
+	uri := s.DownloadURL()
 	if s.Type == GlobalSpeed {
-		url = fmt.Sprintf("%s?key=%s", url, token)
+		uri.RawQuery = fmt.Sprintf("key=%s", token)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, uri.String(), nil)
 	if err != nil {
 		log.Debugf("Failed when creating HTTP request: %s", err)
 		return 0, 0, err
 	}
 
+	if s.Host != "" {
+		req.Host = s.GetHost()
+	}
 	req.Header.Set("User-Agent", BrowserUA)
 	req.Header.Set("Accept", "*/*")
 	req.Header.Set("Connection", "close")
@@ -285,10 +263,17 @@ func (s *Server) Download(silent, useBytes, useMebi bool, requests int, duration
 
 	doDownload := func() {
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
-			log.Debugf("Failed when making HTTP request: %s", err)
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
+				log.Debugf("Failed when making HTTP request: %s", err)
+			}
 		} else {
 			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				log.Debugf("Failed to test download speed: %s", resp.Status)
+				return
+			}
 
 			if _, err = io.Copy(io.Discard, io.TeeReader(resp.Body, counter)); err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
@@ -358,12 +343,15 @@ func (s *Server) Upload(noPrealloc, silent, useBytes, useMebi bool, requests, up
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.UploadURL(), counter)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.UploadURL().String(), counter)
 	if err != nil {
 		log.Debugf("Failed when creating HTTP request: %s", err)
 		return 0, 0, err
 	}
 
+	if s.Host != "" {
+		req.Host = s.GetHost()
+	}
 	req.Header.Set("User-Agent", AndroidUA)
 	if s.Type != WirelessSpeed {
 		req.Header.Set("Connection", "close")
@@ -378,9 +366,11 @@ func (s *Server) Upload(noPrealloc, silent, useBytes, useMebi bool, requests, up
 
 	doUpload := func() {
 		resp, err := http.DefaultClient.Do(req)
-		if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
-			log.Debugf("Failed when making HTTP request: %s", err)
-		} else if err == nil {
+		if err != nil {
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
+				log.Debugf("Failed when making HTTP request: %s", err)
+			}
+		} else {
 			defer resp.Body.Close()
 			if _, err := io.Copy(io.Discard, resp.Body); err != nil {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) && !os.IsTimeout(err) {
